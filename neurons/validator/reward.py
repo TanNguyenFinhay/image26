@@ -16,11 +16,6 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.transforms as T
 from datasets import Dataset
-from diffusers import (
-    AutoPipelineForImage2Image,
-    AutoPipelineForText2Image,
-    DPMSolverMultistepScheduler,
-)
 from loguru import logger
 from neurons.miners.StableMiner.utils import (
     colored_log,
@@ -41,11 +36,23 @@ from transformers import (
     AutoModel,
     CLIPImageProcessor,
 )
+from diffusers import (
+    AutoPipelineForImage2Image,
+    DPMSolverMultistepScheduler,
+    DiffusionPipeline,
+    DDIMScheduler
+)
 
+import threading
+
+from huggingface_hub import hf_hub_download
 import bittensor as bt
 
 transform = T.Compose([T.PILToTensor()])
 
+base_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
+repo_name = "ByteDance/Hyper-SD"
+ckpt_name = "Hyper-SDXL-8steps-CFG-lora.safetensors"
 
 class RewardModelType(Enum):
     diversity = "diversity_reward_model"
@@ -781,26 +788,29 @@ class ModelDiversityRewardModel(BaseRewardModel):
 
     def load_models(self):
         # Load the text-to-image model
-        self.t2i_model = AutoPipelineForText2Image.from_pretrained(
-            self.config.miner.model,
-            torch_dtype=torch.float16,
-            use_safetensors=True,
-            variant="fp16",
-        ).to(self.config.miner.device)
-        self.t2i_model.set_progress_bar_config(disable=True)
-        self.t2i_model.scheduler = DPMSolverMultistepScheduler.from_config(
-            self.t2i_model.scheduler.config
-        )
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "mps")
+        ## n step lora
+        self.pipeline = DiffusionPipeline.from_pretrained(base_model_id, torch_dtype=torch.float16, variant="fp16").to(self.device)
+        self.pipeline.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
+        self.pipeline.fuse_lora()
+        self.pipeline.scheduler = DDIMScheduler.from_config(self.pipeline.scheduler.config, timestep_spacing="trailing")
+        self.steps = 8
+        self.guidance_scale = 5
+
+        
 
         # Load the image to image model using the same pipeline (efficient)
-        self.i2i_model = AutoPipelineForImage2Image.from_pipe(self.t2i_model).to(
-            self.config.miner.device,
-        )
+        # self.i2i_model = AutoPipelineForImage2Image.from_pipe(self.t2i_model).to(
+        #     self.config.miner.device,
+        # )
+        # self.i2i_model.set_progress_bar_config(disable=True)
+        # self.i2i_model.scheduler = DPMSolverMultistepScheduler.from_config(
+        #     self.i2i_model.scheduler.config
+        # )
+        self.i2i_model = self.pipeline  # Use the same pipeline for image-to-image tasks
         self.i2i_model.set_progress_bar_config(disable=True)
-        self.i2i_model.scheduler = DPMSolverMultistepScheduler.from_config(
-            self.i2i_model.scheduler.config
-        )
-
+        self.i2i_model.scheduler = DPMSolverMultistepScheduler.from_config(self.i2i_model.scheduler.config)
+        
         self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
             "CompVis/stable-diffusion-safety-checker"
         ).to(self.config.miner.device)
@@ -808,7 +818,7 @@ class ModelDiversityRewardModel(BaseRewardModel):
 
         # Set up mapping for the different synapse types
         self.mapping = {
-            "TEXT_TO_IMAGE": {"args": self.t2i_args, "model": self.t2i_model},
+            "TEXT_TO_IMAGE": {"args": self.t2i_args, "model": self.pipeline},
             "IMAGE_TO_IMAGE": {"args": self.i2i_args, "model": self.i2i_model},
         }
 
